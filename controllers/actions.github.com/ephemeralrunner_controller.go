@@ -26,7 +26,6 @@ import (
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/actions-runner-controller/github/actions"
 	"github.com/go-logr/logr"
-	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -109,15 +108,7 @@ func (r *EphemeralRunnerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{Requeue: true}, nil
 		}
 
-		done, err = r.cleanupContainerHooksResources(ctx, ephemeralRunner, log)
-		if err != nil {
-			log.Error(err, "Failed to clean up container hooks resources")
-			return ctrl.Result{}, err
-		}
-		if !done {
-			log.Info("Waiting for container hooks resources to be deleted")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+		r.cleanupContainerHooksResources(ctx, ephemeralRunner, log)
 
 		log.Info("Removing finalizer")
 		err = patch(ctx, r.Client, ephemeralRunner, func(obj *v1alpha1.EphemeralRunner) {
@@ -360,41 +351,32 @@ func (r *EphemeralRunnerReconciler) cleanupResources(ctx context.Context, epheme
 	return true, nil
 }
 
-func (r *EphemeralRunnerReconciler) cleanupContainerHooksResources(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) (done bool, err error) {
+func (r *EphemeralRunnerReconciler) cleanupContainerHooksResources(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) {
 	log.Info("Cleaning up runner linked pods")
-	done, err = r.cleanupRunnerLinkedPods(ctx, ephemeralRunner, log)
-	if err != nil {
-		return false, fmt.Errorf("failed to clean up runner linked pods: %v", err)
-	}
-
-	if !done {
-		return false, nil
+	if err := r.cleanupRunnerLinkedPods(ctx, ephemeralRunner, log); err != nil {
+		log.Error(err, "Failed to clean up runner linked pods")
 	}
 
 	log.Info("Cleaning up runner linked secrets")
-	done, err = r.cleanupRunnerLinkedSecrets(ctx, ephemeralRunner, log)
-	if err != nil {
-		return false, err
+	if err := r.cleanupRunnerLinkedSecrets(ctx, ephemeralRunner, log); err != nil {
+		log.Error(err, "Failed to clean up runner linked secrets")
 	}
-
-	return done, nil
 }
 
-func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedPods(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) (done bool, err error) {
+func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedPods(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) error {
 	runnerLinedLabels := client.MatchingLabels(
 		map[string]string{
 			"runner-pod": ephemeralRunner.Name,
 		},
 	)
 	var runnerLinkedPodList corev1.PodList
-	err = r.List(ctx, &runnerLinkedPodList, client.InNamespace(ephemeralRunner.Namespace), runnerLinedLabels)
-	if err != nil {
-		return false, fmt.Errorf("failed to list runner-linked pods: %v", err)
+	if err := r.List(ctx, &runnerLinkedPodList, client.InNamespace(ephemeralRunner.Namespace), runnerLinedLabels); err != nil {
+		return fmt.Errorf("failed to list runner-linked pods: %v", err)
 	}
 
 	if len(runnerLinkedPodList.Items) == 0 {
-		log.Info("Runner-linked pods are deleted")
-		return true, nil
+		log.Info("No container hooks runner-linked pods to delete")
+		return nil
 	}
 
 	log.Info("Deleting container hooks runner-linked pods", "count", len(runnerLinkedPodList.Items))
@@ -412,24 +394,23 @@ func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedPods(ctx context.Context,
 		}
 	}
 
-	return false, multierr.Combine(errs...)
+	return errors.Join(errs...)
 }
 
-func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedSecrets(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) (done bool, err error) {
+func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedSecrets(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, log logr.Logger) error {
 	runnerLinkedLabels := client.MatchingLabels(
 		map[string]string{
 			"runner-pod": ephemeralRunner.ObjectMeta.Name,
 		},
 	)
 	var runnerLinkedSecretList corev1.SecretList
-	err = r.List(ctx, &runnerLinkedSecretList, client.InNamespace(ephemeralRunner.Namespace), runnerLinkedLabels)
-	if err != nil {
-		return false, fmt.Errorf("failed to list runner-linked secrets: %w", err)
+	if err := r.List(ctx, &runnerLinkedSecretList, client.InNamespace(ephemeralRunner.Namespace), runnerLinkedLabels); err != nil {
+		return fmt.Errorf("failed to list runner-linked secrets: %w", err)
 	}
 
 	if len(runnerLinkedSecretList.Items) == 0 {
-		log.Info("Runner-linked secrets are deleted")
-		return true, nil
+		log.Info("No container hooks runner-linked secrets to delete")
+		return nil
 	}
 
 	log.Info("Deleting container hooks runner-linked secrets", "count", len(runnerLinkedSecretList.Items))
@@ -447,7 +428,7 @@ func (r *EphemeralRunnerReconciler) cleanupRunnerLinkedSecrets(ctx context.Conte
 		}
 	}
 
-	return false, multierr.Combine(errs...)
+	return errors.Join(errs...)
 }
 
 func (r *EphemeralRunnerReconciler) markAsFailed(ctx context.Context, ephemeralRunner *v1alpha1.EphemeralRunner, errMessage string, reason string, log logr.Logger) error {
